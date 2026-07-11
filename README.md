@@ -12,6 +12,179 @@
 
 ---
 
+> [!IMPORTANT]
+> ## This is a fork
+>
+> **trae-meridian** is a fork of [rynfar/meridian](https://github.com/rynfar/meridian)
+> that fixes **prompt-cache reuse for the [Trae IDE](https://trae.ai)** (ByteDance's
+> VS Code fork, which identifies as User-Agent `hertz`) and other header-less
+> Anthropic clients. Everything from upstream works unchanged — see the full upstream
+> documentation below. This section describes only what the fork adds and how to run it.
+
+## What the fork fixes
+
+Trae connects to Meridian as a custom Anthropic-compatible provider but sends **no
+session header** (`x-opencode-session`), so Meridian falls back to content-based
+session fingerprinting. Two issues caused nearly every Trae request to be classified
+as a brand-new conversation (`lineage=new`) — the full prompt was rewritten
+(cache-creation, billed 1.25× input) every turn instead of read from cache (0.1×):
+
+1. **`isClientDrivenLoop` over-fired.** A header-less request whose last message is a
+   `tool_result` was force-classified as an independent, non-resumable flow — which
+   is every subagent tool-loop turn.
+2. **Fingerprint collisions between subagents.** The fingerprint hashed only the
+   first user message + cwd. Trae launches subagents from an identical templated
+   first message, so siblings collided on one fingerprint and evicted each other's
+   cached session.
+
+**The fix** (in `src/proxy/server.ts`, `src/proxy/session/{cache,fingerprint}.ts`):
+run the normal fingerprint lookup and trust `verifyLineage` (only diverging when it
+finds no clean resume, so concurrent-loop protection is preserved), and mix the first
+`tool_use` id into the fingerprint (stable per flow, unique per concurrent flow) with
+a base-fingerprint fallback for the transition turn.
+
+Measured on real Trae workloads: **prompt-cache hit rate ~16% → ~83%**, with subagents
+holding `lineage=continuation` across long tool loops. The full upstream test suite
+passes (`bun run test`).
+
+## Recommended install (Linux and macOS)
+
+Run trae-meridian as a background service that starts on login. Both platforms build
+from source (the fix isn't published to npm); the difference is only in the service
+manager — **systemd + tmux** on Linux, **launchd** on macOS.
+
+### 1. Build (both platforms)
+
+Requires [Bun](https://bun.sh) and Node.js ≥ 22.
+
+```bash
+git clone https://github.com/remymenard/trae-meridian.git ~/code/trae-meridian
+cd ~/code/trae-meridian
+bun install
+bun run build          # produces dist/
+claude login           # one-time: authenticate your Claude Max account
+node dist/cli.js        # quick smoke test — Ctrl-C to stop; visit http://127.0.0.1:3456/health
+```
+
+Point Trae (or any Anthropic-compatible tool) at `http://127.0.0.1:3456` with any API
+key value.
+
+### 2a. Linux — systemd (user) + tmux
+
+Runs the proxy inside a detached tmux session named `meridian` so you can attach to
+watch live logs. Adjust the two absolute paths (node binary and repo) if yours differ
+— find your node path with `which node` (or `readlink -f "$(which node)"` under a
+version manager like asdf).
+
+Create `~/.config/systemd/user/meridian.service`:
+
+```ini
+[Unit]
+Description=trae-meridian - Claude proxy w/ Trae session fix (tmux session 'meridian')
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# tmux forks a background server; the launching client exits immediately, so we use
+# Type=oneshot + RemainAfterExit to keep the unit active while the tmux session runs.
+Type=oneshot
+RemainAfterExit=yes
+Environment=HOME=%h
+Environment=MERIDIAN_HOST=127.0.0.1
+Environment=MERIDIAN_PORT=3456
+ExecStart=/usr/bin/tmux new-session -d -s meridian /path/to/node %h/code/trae-meridian/dist/cli.js
+ExecStop=/usr/bin/tmux kill-session -t meridian
+
+[Install]
+WantedBy=default.target
+```
+
+Enable it (linger makes it start at boot without logging in):
+
+```bash
+loginctl enable-linger "$USER"
+systemctl --user daemon-reload
+systemctl --user enable --now meridian.service
+systemctl --user status meridian.service
+curl -s http://127.0.0.1:3456/health
+```
+
+Handy aliases for `~/.zshrc` (or `~/.bashrc`):
+
+```bash
+alias meridian-attach='tmux attach -t meridian'   # live logs — detach with Ctrl-b then d
+alias meridian-logs='tmux capture-pane -t meridian -p'
+alias meridian-status='systemctl --user status meridian.service'
+alias meridian-restart='systemctl --user restart meridian.service'
+```
+
+After a `git pull`, rebuild and restart: `bun run build && systemctl --user restart meridian.service`.
+
+### 2b. macOS — launchd + tmux
+
+macOS uses `launchd` instead of systemd. Same tmux idea, so `meridian-attach` works
+identically. Find your paths first: `which tmux`, `which node`, and use your real
+username (`echo $USER`) — launchd does **not** expand `~`.
+
+Create `~/Library/LaunchAgents/org.trae-meridian.plist` (replace `YOU` and the two
+absolute paths):
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>org.trae-meridian</string>
+  <!-- Launch the proxy inside a detached tmux session named 'meridian'. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/tmux</string>
+    <string>new-session</string><string>-d</string><string>-s</string><string>meridian</string>
+    <string>/opt/homebrew/bin/node</string>
+    <string>/Users/YOU/code/trae-meridian/dist/cli.js</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>MERIDIAN_HOST</key><string>127.0.0.1</string>
+    <key>MERIDIAN_PORT</key><string>3456</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/Users/YOU/Library/Logs/trae-meridian.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/YOU/Library/Logs/trae-meridian.err.log</string>
+</dict>
+</plist>
+```
+
+> `KeepAlive` is intentionally omitted: the tmux launcher exits immediately after
+> spawning the detached server, so `KeepAlive` would relaunch it in a loop. `RunAtLoad`
+> starts it at login; if the proxy crashes inside tmux, restart with the alias below.
+
+Load and manage it:
+
+```bash
+launchctl load ~/Library/LaunchAgents/org.trae-meridian.plist   # start now + at login
+tmux attach -t meridian                                         # live logs (Ctrl-b d to detach)
+curl -s http://127.0.0.1:3456/health
+
+# convenience aliases for ~/.zshrc
+alias meridian-attach='tmux attach -t meridian'
+alias meridian-restart='launchctl kickstart -k gui/$(id -u)/org.trae-meridian'
+alias meridian-stop='launchctl bootout gui/$(id -u)/org.trae-meridian'
+```
+
+After a `git pull`, rebuild and restart: `bun run build && launchctl kickstart -k gui/$(id -u)/org.trae-meridian`.
+
+> **Auth note:** the very first tool-loop turn of a fresh subagent is still a cold
+> start (no tool call yet to disambiguate identical siblings) — that's one uncached
+> turn by design. Everything after resumes from cache.
+
+---
+
+<sub>Upstream Meridian documentation follows.</sub>
+
+---
+
 Meridian bridges the Claude Code SDK to the standard Anthropic API. No OAuth interception. No binary patches. No hacks. Just pure, documented SDK calls. Any tool that speaks the Anthropic or OpenAI protocol — OpenCode, ForgeCode, Crush, Cline, Aider, Pi, Droid, Open WebUI, Claude Code — connects to Meridian and gets Claude, with session management, streaming, and prompt caching handled natively by the SDK.
 
 > [!NOTE]
