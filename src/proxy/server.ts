@@ -456,6 +456,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       try {
         const body = await c.req.json()
 
+
         // Validate required fields
         if (!Array.isArray(body.messages)) {
           return c.json(
@@ -730,12 +731,30 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         const lastMessage = Array.isArray(body.messages) ? body.messages[body.messages.length - 1] : undefined
         const lastIsToolResult = Array.isArray(lastMessage?.content)
           && lastMessage.content.some((b: any) => b?.type === "tool_result")
+        // A headerless request whose last message is a tool_result is *either*:
+        //  (a) a legitimate growing conversation resuming a tool loop — e.g. Trae
+        //      (User-Agent "hertz") and its subagents, which send the full growing
+        //      history and DO want session resume so the prompt cache is reused; or
+        //  (b) one of several concurrent client-driven loops (pylon workflow) that
+        //      share the same (firstUserMessage, cwd) fingerprint and would corrupt
+        //      each other if one resumed another's Claude session.
+        // Forcing (a) to "diverged" (the old behavior) rewrote the whole prompt
+        // cache every turn — cache hit ~16%. Instead, run the normal fingerprint
+        // lookup and let verifyLineage decide: it only returns continuation when
+        // the stored message-prefix hash actually matches this request, so genuinely
+        // divergent concurrent loops still fall through to "diverged" on their own.
         const isClientDrivenLoop = !agentSessionId && lastIsToolResult
         const isIndependentSession =
-          requestSource?.startsWith("fork-") || requestSource?.startsWith("subagent-") || isClientDrivenLoop || false
+          requestSource?.startsWith("fork-") || requestSource?.startsWith("subagent-") || false
         let lineageResult = isIndependentSession
           ? { type: "diverged" as const }
           : lookupSession(profileSessionId, body.messages || [], profileScopedCwd)
+        // Concurrent client-driven loops (headerless, tool_result tail) that share a
+        // fingerprint but are NOT a clean continuation must stay independent — only
+        // downgrade to diverged when verifyLineage did not recognize a resume.
+        if (isClientDrivenLoop && lineageResult.type !== "continuation" && lineageResult.type !== "compaction") {
+          lineageResult = { type: "diverged" }
+        }
         // NOTE: agent-specific (opencode) — when OpenCode's chat.headers plugin
         // hook doesn't fire (category-dispatched or title-generation requests),
         // the request has no session header and falls through to fingerprint

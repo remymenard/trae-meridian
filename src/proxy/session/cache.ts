@@ -13,7 +13,7 @@ import {
   clearSharedSessions,
   evictSharedSession,
 } from "../sessionStore"
-import { getConversationFingerprint } from "./fingerprint"
+import { getConversationFingerprint, getBaseFingerprintIfDifferent } from "./fingerprint"
 import {
   computeLineageHash,
   computeMessageHashes,
@@ -164,29 +164,48 @@ export function lookupSession(
 
   const fp = getConversationFingerprint(messages, workingDirectory)
   if (fp) {
-    const cached = fingerprintCache.get(fp)
-    if (cached) {
-      const result = verifyLineage(cached, messages, fp, fingerprintCache)
-      if (result.type === "continuation" || result.type === "compaction") touchSession(result.session)
-      return result
+    const result = lookupByFingerprint(fp, messages, workingDirectory)
+    if (result.type !== "diverged") return result
+    // Transition turn: the first tool call just appeared, so the primary
+    // fingerprint changed from base -> base+toolId. Retry under the base key
+    // (turn-1 storage) so the session resumes instead of missing once per flow.
+    const baseFp = getBaseFingerprintIfDifferent(messages, workingDirectory)
+    if (baseFp && baseFp !== fp) {
+      const fallback = lookupByFingerprint(baseFp, messages, workingDirectory)
+      if (fallback.type !== "diverged") return fallback
     }
-    const shared = lookupSharedSession(fp)
-    if (shared) {
-      const state: SessionState = {
-        claudeSessionId: shared.claudeSessionId,
-        lastAccess: Date.now(),
-        messageCount: shared.messageCount || 0,
-        lineageHash: shared.lineageHash || "",
-        messageHashes: shared.messageHashes,
-        sdkMessageUuids: shared.sdkMessageUuids,
-        contextUsage: shared.contextUsage,
-      }
-      const result = verifyLineage(state, messages, fp, fingerprintCache)
-      if (result.type === "continuation" || result.type === "compaction") {
-        fingerprintCache.set(fp, state)
-      }
-      return result
+  }
+  return { type: "diverged" }
+}
+
+/** Look up (and, for shared hits, hydrate) a session by a specific fingerprint key. */
+function lookupByFingerprint(
+  fp: string,
+  messages: Array<{ role: string; content: any }>,
+  _workingDirectory?: string
+): LineageResult {
+  const cached = fingerprintCache.get(fp)
+  if (cached) {
+    const result = verifyLineage(cached, messages, fp, fingerprintCache)
+    if (result.type === "continuation" || result.type === "compaction") touchSession(result.session)
+    return result
+  }
+  const shared = lookupSharedSession(fp)
+  if (shared) {
+    const state: SessionState = {
+      claudeSessionId: shared.claudeSessionId,
+      lastAccess: Date.now(),
+      messageCount: shared.messageCount || 0,
+      lineageHash: shared.lineageHash || "",
+      messageHashes: shared.messageHashes,
+      sdkMessageUuids: shared.sdkMessageUuids,
+      contextUsage: shared.contextUsage,
     }
+    const result = verifyLineage(state, messages, fp, fingerprintCache)
+    if (result.type === "continuation" || result.type === "compaction") {
+      fingerprintCache.set(fp, state)
+    }
+    return result
   }
   return { type: "diverged" }
 }
